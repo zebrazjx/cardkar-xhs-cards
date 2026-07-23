@@ -10,15 +10,20 @@ const IMAGE_TYPES = Object.freeze({
   '.jpeg': 'image/jpeg',
   '.webp': 'image/webp',
 });
+const DEFAULT_SECRET_FILE = path.join('.cardkar', 'secret.txt');
+const API_KEY_PATTERN = /^ck_(?:test|live)_[A-Za-z0-9_-]{24,128}$/;
 
 function usage() {
   return `Usage: cardkar-client.mjs --md PATH [options]
 
 Options:
+  --profiles                List creator identities linked to the configured API key
   --cover PATH             Optional 16:9 PNG/JPEG/WebP cover (max 4 MiB)
   --avatar PATH            Optional PNG/JPEG/WebP avatar (max 180 KiB)
+  --profile-id UUID         Use a creator identity returned by --profiles
   --nick TEXT              Creator nickname
   --handle TEXT            Creator handle or subtitle
+  --secret-file PATH        Read the API key from a protected local file
   --max-cards N            Maximum output cards (default: 12)
   --outdir PATH            Output directory (default: ./cardkar-cards)
   --base-url URL           CardKar origin (default: CARDKAR_API_BASE_URL or https://cardkar.com)
@@ -26,17 +31,19 @@ Options:
   --dry-run                Validate files and print a redacted request summary
   --help                   Show this help
 
-Read CARDKAR_API_KEY from the environment. Never pass the key on the command line.`;
+Read CARDKAR_API_KEY from the environment first, then .cardkar/secret.txt.
+Never pass the key on the command line.`;
 }
 
 function parseArgs(argv) {
   const options = Object.create(null);
   const valueFlags = new Set([
-    '--md', '--cover', '--avatar', '--nick', '--handle', '--max-cards', '--outdir', '--base-url', '--idempotency-key',
+    '--md', '--cover', '--avatar', '--profile-id', '--nick', '--handle', '--secret-file',
+    '--max-cards', '--outdir', '--base-url', '--idempotency-key',
   ]);
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
-    if (arg === '--help' || arg === '--dry-run') {
+    if (arg === '--help' || arg === '--dry-run' || arg === '--profiles') {
       options[arg.slice(2)] = true;
       continue;
     }
@@ -47,6 +54,39 @@ function parseArgs(argv) {
     index += 1;
   }
   return options;
+}
+
+function parseSecret(value) {
+  const line = String(value || '').split(/\r?\n/)
+    .map(item => item.trim())
+    .find(item => item && !item.startsWith('#')) || '';
+  return line.startsWith('CARDKAR_API_KEY=') ? line.slice('CARDKAR_API_KEY='.length).trim() : line;
+}
+
+async function loadApiKey(options) {
+  const fromEnvironment = String(process.env.CARDKAR_API_KEY || '').trim();
+  if (fromEnvironment) return { value: fromEnvironment, source: 'environment' };
+  const secretPath = path.resolve(options['secret-file'] || DEFAULT_SECRET_FILE);
+  let stat;
+  try {
+    stat = await fs.stat(secretPath);
+  } catch (error) {
+    if (error?.code === 'ENOENT') return { value: '', source: 'not_configured', path: secretPath };
+    throw error;
+  }
+  if (!stat.isFile()) throw new Error(`CardKar secret path is not a file: ${secretPath}`);
+  if (process.platform !== 'win32' && (stat.mode & 0o077) !== 0) {
+    throw new Error(`CardKar secret file permissions are too broad. Run: chmod 600 "${secretPath}"`);
+  }
+  return {
+    value: parseSecret(await fs.readFile(secretPath, 'utf8')),
+    source: 'workspace_secret_file',
+    path: secretPath,
+  };
+}
+
+function validApiKey(value) {
+  return API_KEY_PATTERN.test(value);
 }
 
 function imageType(filePath) {
@@ -104,6 +144,30 @@ async function main() {
     process.stdout.write(`${usage()}\n`);
     return;
   }
+  const baseUrl = normalizeBaseUrl(options['base-url'] || process.env.CARDKAR_API_BASE_URL || 'https://cardkar.com');
+  const credential = await loadApiKey(options);
+
+  if (options.profiles) {
+    if (!validApiKey(credential.value)) {
+      throw new Error('CardKar API key is missing or invalid. Generate one at https://cardkar.com/workspace?view=api#api-console and save it with cardkar-setup.mjs.');
+    }
+    const response = await fetch(`${baseUrl}/api/v1/skills/me/creator-profiles`, {
+      headers: {
+        Authorization: `Bearer ${credential.value}`,
+        Accept: 'application/json',
+      },
+    });
+    if (!response.ok) throw new Error(await errorMessage(response));
+    const payload = await response.json();
+    process.stdout.write(`${JSON.stringify({
+      ok: true,
+      apiKeyConfigured: true,
+      apiKeySource: credential.source,
+      profiles: Array.isArray(payload.profiles) ? payload.profiles : [],
+    }, null, 2)}\n`);
+    return;
+  }
+
   if (!options.md) throw new Error('--md is required.');
 
   const markdownPath = path.resolve(options.md);
@@ -118,12 +182,23 @@ async function main() {
   const cover = options.cover ? await imageDataUrl(options.cover, 4 * 1024 * 1024, 'Cover') : null;
   const avatarPath = options.avatar || process.env.CARDKAR_AVATAR || '';
   const avatar = avatarPath ? await imageDataUrl(avatarPath, 180 * 1024, 'Avatar') : null;
+  const creatorProfileId = options['profile-id'] || '';
+  if (creatorProfileId && !/^[0-9a-f-]{36}$/i.test(creatorProfileId)) {
+    throw new Error('--profile-id must be a creator identity UUID returned by --profiles.');
+  }
+  if (creatorProfileId && (avatar || options.nick || options.handle)) {
+    throw new Error('--profile-id cannot be combined with --avatar, --nick, or --handle.');
+  }
   const payload = {
     version: '1',
     markdown,
-    nickname: options.nick || process.env.CARDKAR_NICKNAME || '我是卡卡',
-    handle: options.handle || process.env.CARDKAR_HANDLE || '@cardkar',
-    ...(avatar ? { avatarData: avatar.dataUrl } : {}),
+    ...(creatorProfileId
+      ? { creatorProfileId }
+      : {
+          nickname: options.nick || process.env.CARDKAR_NICKNAME || '我是卡卡',
+          handle: options.handle || process.env.CARDKAR_HANDLE || '@cardkar',
+          ...(avatar ? { avatarData: avatar.dataUrl } : {}),
+        }),
     ...(cover ? { coverData: cover.dataUrl } : {}),
     maxCards,
   };
@@ -131,7 +206,6 @@ async function main() {
   if (!/^[A-Za-z0-9_-]{16,96}$/.test(idempotencyKey)) {
     throw new Error('--idempotency-key must contain 16 to 96 URL-safe characters.');
   }
-  const baseUrl = normalizeBaseUrl(options['base-url'] || process.env.CARDKAR_API_BASE_URL || 'https://cardkar.com');
   const outdir = path.resolve(options.outdir || './cardkar-cards');
 
   if (options['dry-run']) {
@@ -141,20 +215,22 @@ async function main() {
       endpoint: `${baseUrl}/api/v1/skills/xhs-highlight/render`,
       markdownPath,
       markdownCharacters: markdown.length,
-      nickname: payload.nickname,
-      handle: payload.handle,
+      creatorProfileId: payload.creatorProfileId || null,
+      nickname: payload.nickname || null,
+      handle: payload.handle || null,
       cover: cover ? { path: cover.absolute, bytes: cover.bytes } : null,
       avatar: avatar ? { path: avatar.absolute, bytes: avatar.bytes } : null,
       maxCards,
       idempotencyKey,
-      apiKeyConfigured: Boolean(process.env.CARDKAR_API_KEY),
+      apiKeyConfigured: validApiKey(credential.value),
+      apiKeySource: credential.source,
     }, null, 2)}\n`);
     return;
   }
 
-  const apiKey = process.env.CARDKAR_API_KEY || '';
-  if (!/^ck_(?:test|live)_[A-Za-z0-9_-]{24,128}$/.test(apiKey)) {
-    throw new Error('CARDKAR_API_KEY is missing or invalid. Configure it in the environment; do not pass it on the command line.');
+  const apiKey = credential.value;
+  if (!validApiKey(apiKey)) {
+    throw new Error('CardKar API key is missing or invalid. Use cardkar-setup.mjs and do not paste the key into chat.');
   }
 
   const response = await fetch(`${baseUrl}/api/v1/skills/xhs-highlight/render`, {
