@@ -59,7 +59,7 @@ function safeArchiveEntries(value) {
   ));
 }
 
-async function installPackage(packageBytes, expectedHash) {
+async function installPackage(packageBytes, expectedHash, expectedVersion) {
   const actualHash = crypto.createHash('sha256').update(packageBytes).digest('hex');
   if (actualHash !== expectedHash) throw new Error('Downloaded Skill package failed SHA-256 verification.');
 
@@ -84,7 +84,13 @@ async function installPackage(packageBytes, expectedHash) {
       fs.stat(path.join(extractedSkill, 'scripts', 'cardkar-client.mjs')),
       fs.stat(path.join(extractedSkill, 'scripts', 'cardkar-update.mjs')),
     ]);
-    if (!/^---\n[\s\S]*?name:\s*cardkar-xhs-cards\s*$/m.test(skillMarkdown) || !clientStat.isFile() || !updaterStat.isFile()) {
+    const packagedVersion = skillMarkdown.match(/当前版本：`(\d+\.\d+\.\d+)`/)?.[1] || '';
+    if (
+      !/^---\n[\s\S]*?name:\s*cardkar-xhs-cards\s*$/m.test(skillMarkdown)
+      || packagedVersion !== expectedVersion
+      || !clientStat.isFile()
+      || !updaterStat.isFile()
+    ) {
       throw new Error('Downloaded Skill package is incomplete.');
     }
 
@@ -158,7 +164,7 @@ async function main() {
     return;
   }
   const packageBytes = await fetchBytes(packageUrl, MAX_PACKAGE_BYTES);
-  await installPackage(packageBytes, manifest.sha256);
+  await installPackage(packageBytes, manifest.sha256, manifest.version);
   process.stdout.write(`${JSON.stringify({
     ok: true,
     previousVersion: CURRENT_VERSION,
