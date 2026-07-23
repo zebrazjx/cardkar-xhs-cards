@@ -1,0 +1,4 @@
+interface:
+  display_name: "CardKar 小红书卡片"
+  short_description: "用 Codex 写作和生图，再通过 CardKar API 生成高清小红书卡片"
+  default_prompt: "Use $cardkar-xhs-cards to turn my topic or Markdown into a polished Xiaohongshu card set."
